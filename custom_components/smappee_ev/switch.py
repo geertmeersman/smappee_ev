@@ -37,6 +37,10 @@ async def async_setup_entry(
     for sid, site in (sites or {}).items():
         stations = (site or {}).get("stations", {})
         for st_uuid, bucket in (stations or {}).items():
+            # GUARD: Prevent charger interrupter relays from displaying under the grid hub
+            if "GRID_" in st_uuid.upper():
+                continue
+
             coord: SmappeeCoordinator = bucket["coordinator"]
             st_client: SmappeeApiClient = bucket["station_client"]
             conns: dict[str, SmappeeApiClient] = bucket.get("connector_clients", {})
@@ -51,7 +55,7 @@ async def async_setup_entry(
                 )
             )
 
-            # Connector-level switches
+            # Direct connector power overrides
             for cuuid, client in (conns or {}).items():
                 entities.append(
                     SmappeeChargingSwitch(
@@ -159,15 +163,15 @@ class SmappeeChargingSwitch(SmappeeConnectorEntity, SwitchEntity, RestoreEntity)
 
 
 class SmappeeAvailabilitySwitch(SmappeeStationEntity, SwitchEntity):
-    """Switch to toggle station availability (acchargingstation action)."""
+    """Switch to toggle general station availability state."""
 
     _attr_has_entity_name = True
+    _attr_name = "Station available"
 
     def __init__(
         self,
-        *,
         coordinator: SmappeeCoordinator,
-        api_client: SmappeeApiClient,  # <-- station client
+        api_client: SmappeeApiClient,
         sid: int,
         station_uuid: str,
     ) -> None:

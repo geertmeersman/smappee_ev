@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, datetime
+import logging
 
 from homeassistant.components.sensor import (
     RestoreSensor,
@@ -25,17 +26,15 @@ from .coordinator import SmappeeCoordinator
 from .data import SmappeeEvConfigEntry
 from .helpers import build_connector_label, safe_sum, update_total_increasing
 
+_LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: SmappeeEvConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    # Access runtime data directly (preferred over hass.data lookups)
     runtime = config_entry.runtime_data
-    sites = (
-        runtime.sites
-    )  # { sid: { "stations": { st_uuid: {coordinator, station_client, connector_clients} } } }
+    sites = runtime.sites
 
     entities: list[SensorEntity] = []
 
@@ -46,38 +45,46 @@ async def async_setup_entry(
             st_client: SmappeeApiClient = bucket["station_client"]
             conns: dict[str, SmappeeApiClient] = bucket.get("connector_clients", {})
 
-            # ---- Station sensors ----
-            entities.append(SmappeeMqttLastSeenSensor(coord, st_client, sid, st_uuid))
-            entities.append(StationGridPower(coord, st_client, sid, st_uuid))
-            entities.append(StationPvPower(coord, st_client, sid, st_uuid))
-            entities.append(StationHouseConsumptionPower(coord, st_client, sid, st_uuid))
-            entities.append(StationGridEnergyImport(coord, st_client, sid, st_uuid))
-            entities.append(StationGridEnergyExport(coord, st_client, sid, st_uuid))
-            entities.append(StationPvEnergyImport(coord, st_client, sid, st_uuid))
-            entities.append(StationGridCurrents(coord, st_client, sid, st_uuid))
-            entities.append(StationGridCurrentL1(coord, st_client, sid, st_uuid))
-            entities.append(StationGridCurrentL2(coord, st_client, sid, st_uuid))
-            entities.append(StationGridCurrentL3(coord, st_client, sid, st_uuid))
-            entities.append(StationPvCurrents(coord, st_client, sid, st_uuid))
-            entities.append(StationPvCurrentL1(coord, st_client, sid, st_uuid))
-            entities.append(StationPvCurrentL2(coord, st_client, sid, st_uuid))
-            entities.append(StationPvCurrentL3(coord, st_client, sid, st_uuid))
-            entities.append(StationGridVoltageL1(coord, st_client, sid, st_uuid))
-            entities.append(StationGridVoltageL2(coord, st_client, sid, st_uuid))
-            entities.append(StationGridVoltageL3(coord, st_client, sid, st_uuid))
+            is_grid_monitor = "GRID_" in st_uuid.upper()
 
-            # ---- Connector sensors ----
-            for cuuid, client in (conns or {}).items():
-                entities.append(ConnectorPowerSensor(coord, client, sid, st_uuid, cuuid))
-                entities.append(ConnectorCurrentASensor(coord, client, sid, st_uuid, cuuid))
-                entities.append(SmappeeSupportGridSensor(coord, client, sid, st_uuid, cuuid))
-                entities.append(ConnEnergyImport(coord, client, sid, st_uuid, cuuid))
-                entities.append(SmappeeChargingStateSensor(coord, client, sid, st_uuid, cuuid))
-                entities.append(SmappeeEVCCStateSensor(coord, client, sid, st_uuid, cuuid))
-                entities.append(SmappeeEvseStatusSensor(coord, client, sid, st_uuid, cuuid))
-                entities.append(ConnCurrentL1(coord, client, sid, st_uuid, cuuid))
-                entities.append(ConnCurrentL2(coord, client, sid, st_uuid, cuuid))
-                entities.append(ConnCurrentL3(coord, client, sid, st_uuid, cuuid))
+            # ---- Station sensors ----
+            # The MQTT Last Seen diagnostics belong to both
+            entities.append(SmappeeMqttLastSeenSensor(coord, st_client, sid, st_uuid))
+
+            if is_grid_monitor:
+                _LOGGER.debug("Registering GRID sensors for %s", st_uuid)
+                # ONLY add electricity clamp sensors to the pure Grid Monitor
+                entities.append(StationGridPower(coord, st_client, sid, st_uuid))
+                entities.append(StationPvPower(coord, st_client, sid, st_uuid))
+                entities.append(StationHouseConsumptionPower(coord, st_client, sid, st_uuid))
+                entities.append(StationGridEnergyImport(coord, st_client, sid, st_uuid))
+                entities.append(StationGridEnergyExport(coord, st_client, sid, st_uuid))
+                entities.append(StationPvEnergyImport(coord, st_client, sid, st_uuid))
+                entities.append(StationGridCurrents(coord, st_client, sid, st_uuid))
+                entities.append(StationGridCurrentL1(coord, st_client, sid, st_uuid))
+                entities.append(StationGridCurrentL2(coord, st_client, sid, st_uuid))
+                entities.append(StationGridCurrentL3(coord, st_client, sid, st_uuid))
+                entities.append(StationPvCurrents(coord, st_client, sid, st_uuid))
+                entities.append(StationPvCurrentL1(coord, st_client, sid, st_uuid))
+                entities.append(StationPvCurrentL2(coord, st_client, sid, st_uuid))
+                entities.append(StationPvCurrentL3(coord, st_client, sid, st_uuid))
+                entities.append(StationGridVoltageL1(coord, st_client, sid, st_uuid))
+                entities.append(StationGridVoltageL2(coord, st_client, sid, st_uuid))
+                entities.append(StationGridVoltageL3(coord, st_client, sid, st_uuid))
+            else:
+                _LOGGER.debug("Registering CHARGER sensors for %s", st_uuid)
+                # ---- Connector sensors (ONLY assign to the true EV Wall profile) ----
+                for cuuid, client in (conns or {}).items():
+                    entities.append(ConnectorPowerSensor(coord, client, sid, st_uuid, cuuid))
+                    entities.append(ConnectorCurrentASensor(coord, client, sid, st_uuid, cuuid))
+                    entities.append(SmappeeSupportGridSensor(coord, client, sid, st_uuid, cuuid))
+                    entities.append(ConnEnergyImport(coord, client, sid, st_uuid, cuuid))
+                    entities.append(SmappeeChargingStateSensor(coord, client, sid, st_uuid, cuuid))
+                    entities.append(SmappeeEVCCStateSensor(coord, client, sid, st_uuid, cuuid))
+                    entities.append(SmappeeEvseStatusSensor(coord, client, sid, st_uuid, cuuid))
+                    entities.append(ConnCurrentL1(coord, client, sid, st_uuid, cuuid))
+                    entities.append(ConnCurrentL2(coord, client, sid, st_uuid, cuuid))
+                    entities.append(ConnCurrentL3(coord, client, sid, st_uuid, cuuid))
 
     async_add_entities(entities, True)
 

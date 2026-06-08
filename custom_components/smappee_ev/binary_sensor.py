@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
@@ -11,6 +13,7 @@ from .coordinator import SmappeeCoordinator
 from .data import SmappeeEvConfigEntry
 from .helpers import station_serial
 
+_LOGGER = logging.getLogger(__name__)
 
 def _station_serial(coord: SmappeeCoordinator) -> str:
     return station_serial(coord)
@@ -24,14 +27,26 @@ async def async_setup_entry(
     runtime = config_entry.runtime_data
     sites = runtime.sites
 
-    entities: list[SmappeeMqttConnectivity] = []
+    entities: list[SmappeeStationEntity] = []
     for sid, site in (sites or {}).items():
         stations = (site or {}).get("stations", {})
         for st_uuid, bucket in (stations or {}).items():
             coord: SmappeeCoordinator = bucket["coordinator"]
             st_client: SmappeeApiClient = bucket["station_client"]
+            conns: dict[str, SmappeeApiClient] = bucket.get("connector_clients", {})
             entities.append(SmappeeMqttConnectivity(coord, st_client, sid, st_uuid))
 
+            # GUARD: Only append hardware car pilot-wire sensing loops to the charger
+            if "GRID_" in st_uuid.upper():
+                continue
+
+            for cuuid, client in (conns or {}).items():
+                # Append station sensors for each connector
+                _LOGGER.debug(
+                    "Placeholder for future connector-level binary sensors on station %s connector %s",
+                    sid,
+                    st_uuid,
+                )
     async_add_entities(entities, True)
 
 

@@ -258,17 +258,31 @@ def _assign_connectors(stations, car_devs, mapping, oauth_client, serial_str, si
             )
 
 
-def _fallback_assign(stations, car_devs, oauth_client, serial_str, sid, session):
+def _fallback_assign(
+    stations: dict[str, dict],
+    car_devs: list[dict],
+    oauth_client: OAuth2Client,
+    serial_str: str,
+    sid: int,
+    session: ClientSession,
+) -> None:
+    """Assign all remaining connectors to the first station if no mapping was found."""
+    if not car_devs:
+        return
+
     total_assigned = sum(len(b["connector_clients"]) for b in stations.values())
     if total_assigned > 0:
         return
+
     first_uuid = next(iter(stations.keys()), None)
     if not first_uuid:
         return
+
     st_serial = stations.get(first_uuid, {}).get("serial")
     _LOGGER.warning(
         "Could not map connectors to stations at %s; assigning all to first station", sid
     )
+
     subset = {}
     for d in car_devs:
         cuuid = _safe_str(d.get("uuid"))
@@ -345,6 +359,7 @@ async def _prepare_site(
     sl: dict,
     update_interval: int,
     client_id_prefix: str,
+    processed_uuids: set[str],
     config_entry: SmappeeEvConfigEntry | None = None,
 ) -> tuple[dict[str, dict] | None, SmappeeMqtt | None]:
     """Build coordinators, station/connector clients and MQTT for one service location."""
@@ -352,63 +367,59 @@ async def _prepare_site(
     sid = sl["serviceLocationId"]
     suuid = sl.get("serviceLocationUuid")
     serial_str = (sl.get("deviceSerialNumber") or "").strip()
+    site_name = (sl.get("name") or "").strip()
+
+    _LOGGER.debug("[Smappee EV] Booting integration infrastructure for profile: %s", site_name)
+
     if not serial_str:
-        _LOGGER.warning("Service location %s has no valid deviceSerialNumber; skipping", sid)
         return None, None
 
-    devices = await _fetch_devices(session, oauth_client, sid)
-    if devices is None:
-        return None, None
+    # Determine if this profile represents a dedicated grid/mains monitor
+    is_grid_profile = "WALL" not in site_name.upper() and "CHARGER" not in site_name.upper()
 
-    station_devs, car_devs = _split_devices(devices)
-    if not station_devs and not car_devs:
-        _LOGGER.info("No chargers at %s (%s); skipping", sl.get("name") or f"Smappee {sid}", sid)
-        return None, None
-    if not station_devs:
-        _LOGGER.warning(
-            "No CHARGINGSTATION smartdevice at %s (%s); skipping site", sl.get("name"), sid
+    if is_grid_profile:
+        # PURE GRID MONITOR INFRASTRUCTURE:
+        # Do not fetch or process any smartdevices or charger assets.
+        # Create a clean virtual station list using the location's true native parameters.
+        _LOGGER.debug("[Smappee EV] Configuring grid profile tracker for site %s (%s)", site_name, serial_str)
+
+        # We model the grid box under a clean local grid-specific unique token
+        grid_uuid = f"grid_{serial_str}"
+        st_client = SmappeeApiClient(
+            oauth_client, serial_str, grid_uuid, str(sid), sid, session=session, is_station=True
         )
-        return None, None
+        stations = {
+            grid_uuid: {
+                "station_client": st_client,
+                "connector_clients": {},
+                "coordinator": None,
+                "mqtt": None,
+                "serial": serial_str,
+            }
+        }
+    else:
+        # PURE EV CHARGER INFRASTRUCTURE:
+        devices = await _fetch_devices(session, oauth_client, sid)
+        if devices is None:
+            return None, None
 
-    # station_serial -> {connectors}
-    station_serial_to_connectors = await _fetch_metering_cfg(
-        oauth_client, session, sid, serial_str, station_devs
-    )
+        station_devs, car_devs = _split_devices(devices)
+        display_station_devs = station_devs if station_devs else (devices[:1] if devices else [])
+        if not display_station_devs:
+            return None, None
 
-    # filter smartdevices who only belong in mappings to stations/connectors
-    allowed_station_serials = set(station_serial_to_connectors.keys())
-    if allowed_station_serials:
-        station_devs = [
-            sd
-            for sd in station_devs
-            if (_find_in(sd, "serialNumber", "serial") or _safe_str(sd.get("uuid")))
-            in allowed_station_serials
-        ]
+        station_serial_to_connectors = await _fetch_metering_cfg(
+            oauth_client, session, sid, serial_str, display_station_devs
+        )
 
-    allowed_connector_uuids = {
-        cu for m in station_serial_to_connectors.values() for cu in (m.get("connectors") or {})
-    }
-    if allowed_connector_uuids:
-        car_devs = [cd for cd in car_devs if _safe_str(cd.get("uuid")) in allowed_connector_uuids]
+        stations = _make_station_clients(oauth_client, serial_str, sid, session, display_station_devs)
+        _assign_connectors(stations, car_devs, station_serial_to_connectors, oauth_client, serial_str, sid, session)
+        _fallback_assign(stations, car_devs, oauth_client, serial_str, sid, session)
 
-    # build station map with station_client + empty connector buckets
-    stations = _make_station_clients(oauth_client, serial_str, sid, session, station_devs)
-
-    # fill connector buckets
-    _assign_connectors(
-        stations, car_devs, station_serial_to_connectors, oauth_client, serial_str, sid, session
-    )
-
-    # fallback if no assignment worked
-    _fallback_assign(stations, car_devs, oauth_client, serial_str, sid, session)
-
-    # create coordinators per station
+    # Spawn your data streams
     await _create_coordinators(hass, stations, update_interval, config_entry=config_entry)
-
-    # MQTT (shared per site, but updates all station coordinators)
     mqtt = _setup_mqtt(hass, suuid, serial_str, sid, stations, client_id_prefix)
 
-    # put mqtt ref in each bucket
     for b in stations.values():
         b["mqtt"] = mqtt
 
@@ -461,32 +472,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: SmappeeEvConfigEntry) ->
 
     sites: dict[int, dict] = {}
     mqtt_clients: dict[int, SmappeeMqtt] = {}
+    processed_smart_device_uuids: set[str] = set()
+
+    # Sorteer zodat laadpalen eerst starten (voor de juiste MQTT luisteraar)
+    with_serial.sort(key=lambda x: "WALL" in (x.get("name") or "").upper(), reverse=True)
 
     # 2) Prepare each site in parallel
     client_id_prefix = f"ha-{entry.entry_id[-6:]}"
-    prep_tasks = [
-        _prepare_site(
-            hass,
-            session,
-            oauth_client,
-            sl,
-            update_interval,
-            client_id_prefix,
-            config_entry=entry,
-        )
-        for sl in with_serial
-    ]
-    results = await asyncio.gather(*prep_tasks, return_exceptions=True)
-    for sl, res in zip(with_serial, results, strict=True):
-        if isinstance(res, asyncio.CancelledError):
-            raise res
-        if isinstance(res, BaseException):
-            _LOGGER.warning("Site %s preparation failed: %s", sl.get("serviceLocationId"), res)
+
+    for sl in with_serial:
+        sid = sl.get("serviceLocationId")
+        try:
+            res = await _prepare_site(
+                hass,
+                session,
+                oauth_client,
+                sl,
+                update_interval,
+                client_id_prefix,
+                processed_smart_device_uuids,
+                config_entry=entry,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as res_err:
+            _LOGGER.warning("Site %s initialization failed: %s", sid, res_err)
             continue
+
+        if not res:
+            continue
+
         stations_map, mqtt = res
         if not stations_map:
             continue
-        sid = sl["serviceLocationId"]
+
         if mqtt:
             mqtt_clients[sid] = mqtt
         sites[sid] = {
@@ -497,10 +516,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: SmappeeEvConfigEntry) ->
         }
 
     if not sites:
-        _LOGGER.debug("Discovered service locations but no stations mapped yet (retry later)")
-        raise ConfigEntryNotReady("No Smappee EV stations discovered (will retry)")
+        raise ConfigEntryNotReady("Smappee API layout mapping failed")
 
-    # Store runtime data only on the entry (preferred pattern); avoid duplicating in hass.data
     runtime = RuntimeData(
         api=oauth_client,
         sites=sites,
@@ -508,38 +525,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: SmappeeEvConfigEntry) ->
     )
     entry.runtime_data = runtime
 
-    # Platforms start
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Services already registered domain-wide in async_setup
-
-    for _svc in ("set_available", "set_unavailable", "set_brightness", "set_min_surpluspct"):
-        try:
-            if hass.services.has_service(DOMAIN, _svc):
-                hass.services.async_remove(DOMAIN, _svc)
-                _LOGGER.info("Removed deprecated service %s.%s", DOMAIN, _svc)
-        except (RuntimeError, ValueError) as err:
-            _LOGGER.debug("While removing deprecated service %s: %s", _svc, err)
-
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: SmappeeEvConfigEntry) -> bool:
-    """Unload a Smappee EV config entry."""
-    _LOGGER.debug("Unloading Smappee EV config entry: %s", entry.entry_id)
+    """Unload a Smappee EV config entry clean."""
     try:
         rd = entry.runtime_data
     except AttributeError:
-        _LOGGER.debug(
-            "Unload requested for %s but no runtime_data present (may have failed early)",
-            entry.entry_id,
-        )
+        pass
     else:
         if isinstance(rd, RuntimeData):
-            # Stop all MQTT clients referenced in runtime_data
             for sid, mqtt in (rd.mqtt or {}).items():
                 stop_fn = getattr(mqtt, "stop", None)
-                if not callable(stop_fn):  # pragma: no cover - defensive
+                if not callable(stop_fn):
                     continue
                 try:
                     result = stop_fn()
@@ -547,12 +547,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: SmappeeEvConfigEntry) -
                         await result
                 except asyncio.CancelledError:
                     raise
-                except (RuntimeError, OSError) as err:
-                    _LOGGER.warning(
-                        "Failed to stop MQTT client for service location %s: %s", sid, err
-                    )
+                except Exception as err:
+                    _LOGGER.warning("Failed terminating MQTT listener: %s", err)
 
-            # Allow coordinators to shutdown any background tasks
             for site in (rd.sites or {}).values():
                 for bucket in site.get("stations", {}).values():
                     coord = bucket.get("coordinator")
@@ -561,21 +558,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: SmappeeEvConfigEntry) -
                             await coord.async_shutdown()
                         except asyncio.CancelledError:
                             raise
-                        except (RuntimeError, OSError, ValueError) as exc:
-                            _LOGGER.debug("Coordinator shutdown issue: %s", exc)
-        else:
-            _LOGGER.debug(
-                "Unload requested for %s but runtime_data is invalid (may have failed early)",
-                entry.entry_id,
-            )
+                        except Exception:
+                            pass
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        # If no other loaded entries, unregister services
         active_entries = [
-            e
-            for e in hass.config_entries.async_entries(DOMAIN)
-            if e.state is ConfigEntryState.LOADED
+            e for e in hass.config_entries.async_entries(DOMAIN) if e.state is ConfigEntryState.LOADED
         ]
         if not active_entries and hass.services.has_service(DOMAIN, _SERVICE_REGISTRATION_SENTINEL):
             await unregister_services(hass)
@@ -598,28 +587,20 @@ def _current_station_device_identifiers(entry: SmappeeEvConfigEntry) -> set[str]
             serial = bucket.get("serial")
             if not serial:
                 station_client = bucket.get("station_client")
-                serial = getattr(station_client, "serial_id", None) or getattr(
-                    station_client, "serial", None
-                )
+                serial = getattr(station_client, "serial_id", None) or getattr(station_client, "serial", None)
             if serial:
                 identifiers.add(f"{sid}:{serial}:{station_uuid}")
     return identifiers
 
 
 async def async_remove_config_entry_device(
-    hass: HomeAssistant,
-    entry: SmappeeEvConfigEntry,
-    device_entry: dr.DeviceEntry,
+    hass: HomeAssistant, entry: SmappeeEvConfigEntry, device_entry: dr.DeviceEntry
 ) -> bool:
     """Allow users to remove stale Smappee EV devices from the registry."""
-    domain_identifiers = {
-        identifier for domain, identifier in device_entry.identifiers if domain == DOMAIN
-    }
+    domain_identifiers = {identifier for domain, identifier in device_entry.identifiers if domain == DOMAIN}
     if not domain_identifiers:
         return True
-
     current_identifiers = _current_station_device_identifiers(entry)
     if not current_identifiers:
         return False
-
     return domain_identifiers.isdisjoint(current_identifiers)

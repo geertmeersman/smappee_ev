@@ -118,9 +118,13 @@ class SmappeeCoordinator(DataUpdateCoordinator[IntegrationData]):
                 else:
                     connectors_state[uuid] = cast(ConnectorState, res)
 
+            data = IntegrationData(station=station_state, connectors=connectors_state)
+
+            await self._sync_firmware_version(data)
+
             await self._ensure_power_index_map()
 
-            return IntegrationData(station=station_state, connectors=connectors_state)
+            return data
 
         except asyncio.CancelledError:
             raise
@@ -132,7 +136,7 @@ class SmappeeCoordinator(DataUpdateCoordinator[IntegrationData]):
             raise UpdateFailed(f"Error fetching Smappee data: {err}") from err
 
     async def _ensure_power_index_map(self) -> None:
-        """Load and cache metering index mapping once."""
+        """Load and cache metering index mapping only."""
         if self._power_index_map is not None:
             return
 
@@ -141,6 +145,30 @@ class SmappeeCoordinator(DataUpdateCoordinator[IntegrationData]):
             return
 
         self._power_index_map = self._build_power_index_map(cfg)
+
+    async def _sync_firmware_version(self, data: IntegrationData) -> None:
+        """Helper to bind firmware from cached metering config."""
+        # Ensure config is cached (this populates self._power_index_map)
+        await self._ensure_power_index_map()
+
+        # Check if we have a match
+        cfg = await self.station_client.async_get_metering_configuration()
+        if cfg:
+            client_serial = str(self.station_client.serial_id)
+            for cs in cfg.get("chargingStations", []):
+                candidates = {
+                    str(cs.get("serialNumber")),
+                    str(cs.get("connectSerialNumber")),
+                    str(cs.get("deviceSerialNumber")),
+                }
+                # Check nested mainDevices serials as shown in your logs
+                for md in cs.get("mainDevices", []):
+                    candidates.add(str(md.get("serialNumber")))
+
+                if client_serial in [str(s) for s in candidates if s]:
+                    firmware = cs.get("firmwareVersion")
+                    data.station.firmware_version = firmware
+                    break
 
     def _build_power_index_map(self, cfg: dict) -> dict:
         """

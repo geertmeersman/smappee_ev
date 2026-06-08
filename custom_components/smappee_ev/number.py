@@ -36,11 +36,15 @@ async def async_setup_entry(
     for sid, site in (sites or {}).items():
         stations = (site or {}).get("stations", {})
         for st_uuid, bucket in (stations or {}).items():
+            # GUARD: Do not spawn charging limit slider configuration nodes for the grid monitor
+            if "GRID_" in st_uuid.upper():
+                continue
+
             coord: SmappeeCoordinator = bucket["coordinator"]
             st_client: SmappeeApiClient = bucket["station_client"]
             conns: dict[str, SmappeeApiClient] = bucket.get("connector_clients", {})
 
-            # Per connector
+            # Per connector configuration blocks
             for cuuid, client in (conns or {}).items():
                 entities.append(
                     SmappeeCombinedCurrentSlider(
@@ -61,7 +65,7 @@ async def async_setup_entry(
                     )
                 )
 
-            # Station-level (LED Brightness)
+            # Station infrastructure elements
             entities.append(
                 SmappeeBrightnessNumber(
                     coordinator=coord,

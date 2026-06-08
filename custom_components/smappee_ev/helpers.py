@@ -1,23 +1,50 @@
-# custom_components/smappee_ev/helpers.py
-
 from __future__ import annotations
 
 from typing import Any
 
-from .const import DOMAIN
+from homeassistant.helpers.device_registry import DeviceInfo
+
+from .const import CONFIGURATIN_URL, DOMAIN, MANUFACTURER
 
 
 def make_device_info(
     sid: int,
     serial: str,
     station_uuid: str,
-) -> dict:
-    """Return a Home Assistant device_info dict for a given station."""
-    return {
-        "identifiers": {(DOMAIN, f"{sid}:{serial}:{station_uuid}")},
-        "name": f"Smappee EV {serial}",
-        "manufacturer": "Smappee",
-    }
+    model: str | None = None,
+    sw_version: str | None = None,
+    via_device_uuid: str | None = None,
+    device_identifiers: set[tuple[str, str]] | None = None,
+    device_name: str | None = None,
+    serial_number: str | None = None,
+) -> DeviceInfo:
+    """Return a Home Assistant DeviceInfo object for a given station or sub-component.
+    Accepts explicit identifiers and display names computed by the entity layer
+    to prevent entity overlapping and device merging in the Home Assistant UI.
+    """
+
+    # Use the isolated identifiers and names provided by the entity if available
+    identifiers = device_identifiers if device_identifiers else {(DOMAIN, f"{sid}:{serial}:{station_uuid}")}
+    name = device_name if device_name else f"Smappee EV {serial}"
+
+    device_info = DeviceInfo(
+        identifiers=identifiers,
+        name=name,
+        manufacturer=MANUFACTURER,
+        configuration_url=CONFIGURATIN_URL,
+        serial_number=serial_number,
+    )
+
+    if model:
+        device_info["model"] = model
+    if sw_version:
+        device_info["sw_version"] = sw_version
+
+    # Establish a clean parent-child layout nested view in the HA UI if specified
+    if via_device_uuid:
+        device_info["via_device"] = (DOMAIN, f"{sid}:{serial}:{via_device_uuid}")
+
+    return device_info
 
 
 def make_unique_id(

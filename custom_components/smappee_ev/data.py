@@ -54,6 +54,8 @@ class StationState:
 
     led_brightness: int | None = None
     available: bool = True
+    firmware_version: str | None = None
+    device_type: str = "charger"
 
     mqtt_connected: bool | None = None
     last_mqtt_rx: float | None = None

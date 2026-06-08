@@ -1,6 +1,8 @@
 from typing import Final
 
 DOMAIN = "smappee_ev"
+MANUFACTURER: Final = "Smappee"
+CONFIGURATIN_URL: Final = "https://dashboard.smappee.net"
 
 # Coordinator polling interval (seconds) – kept internal, no user option anymore
 UPDATE_INTERVAL_DEFAULT: Final = 30

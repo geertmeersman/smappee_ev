@@ -28,11 +28,15 @@ async def async_setup_entry(
     for sid, site in (sites or {}).items():
         stations = (site or {}).get("stations", {})
         for st_uuid, bucket in (stations or {}).items():
+            # GUARD: Ensure charger service action routines do not build inside grid assets
+            if "GRID_" in st_uuid.upper():
+                continue
+
             coord: SmappeeCoordinator = bucket["coordinator"]
             conns: dict[str, SmappeeApiClient] = bucket.get("connector_clients", {})
 
             for cuuid, client in (conns or {}).items():
-                lbl = build_connector_label(client, cuuid).split(" ", 1)[1]  # get number / tail
+                lbl = build_connector_label(client, cuuid).split(" ", 1)[1]
                 entities.extend(
                     [
                         SmappeeActionButton(
@@ -41,8 +45,9 @@ async def async_setup_entry(
                             sid=sid,
                             station_uuid=st_uuid,
                             connector_uuid=cuuid,
-                            name=f"Start charging {lbl}",
                             action="start_charging",
+                            name=f"Start charging {lbl}",
+                            icon_name="mdi:play",
                         ),
                         SmappeeActionButton(
                             coordinator=coord,
@@ -50,8 +55,9 @@ async def async_setup_entry(
                             sid=sid,
                             station_uuid=st_uuid,
                             connector_uuid=cuuid,
-                            name=f"Pause charging {lbl}",
                             action="pause_charging",
+                            name=f"Pause charging {lbl}",
+                            icon_name="mdi:pause",
                         ),
                         SmappeeActionButton(
                             coordinator=coord,
@@ -59,8 +65,9 @@ async def async_setup_entry(
                             sid=sid,
                             station_uuid=st_uuid,
                             connector_uuid=cuuid,
-                            name=f"Stop charging {lbl}",
                             action="stop_charging",
+                            name=f"Stop charging {lbl}",
+                            icon_name="mdi:stop",
                         ),
                         SmappeeActionButton(
                             coordinator=coord,
@@ -68,8 +75,9 @@ async def async_setup_entry(
                             sid=sid,
                             station_uuid=st_uuid,
                             connector_uuid=cuuid,
-                            name=f"Set charging mode {lbl}",
                             action="set_charging_mode",
+                            name=f"Set charging mode {lbl}",
+                            icon_name="mdi:sync",
                         ),
                     ]
                 )
@@ -90,6 +98,7 @@ class SmappeeActionButton(SmappeeConnectorEntity, ButtonEntity):
         connector_uuid: str,
         name: str,
         action: str,
+        icon_name: str | None = None,
     ) -> None:
         # Build name/unique id via base class
         SmappeeConnectorEntity.__init__(
@@ -103,6 +112,8 @@ class SmappeeActionButton(SmappeeConnectorEntity, ButtonEntity):
         )
         self.api_client = api_client
         self._action = action
+        if icon_name:
+            self._attr_icon = icon_name
 
     async def async_press(self) -> None:
         """Execute the action on press."""

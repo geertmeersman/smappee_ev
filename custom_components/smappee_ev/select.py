@@ -24,6 +24,10 @@ async def async_setup_entry(
     for sid, site in (sites or {}).items():
         stations = (site or {}).get("stations", {})
         for st_uuid, bucket in (stations or {}).items():
+            # GUARD: Skip charger select controls on the grid monitor profile
+            if "GRID_" in st_uuid.upper():
+                continue
+
             coord: SmappeeCoordinator = bucket["coordinator"]
             conns: dict[str, SmappeeApiClient] = bucket.get("connector_clients", {})
 
